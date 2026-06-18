@@ -1,0 +1,21 @@
+# --- Config & validation ---
+pydantic==2.10.4
+pydantic-settings==2.7.1
+python-dotenv==1.0.1
+
+# --- Parsing (syntactic, never executes the target code) ---
+# >=0.24 needed to load grammars built with language ABI 15 (e.g. c-sharp);
+# newer runtimes remain backward-compatible with the ABI-14 grammars below.
+tree-sitter>=0.24,<0.26
+tree-sitter-python==0.23.6
+tree-sitter-javascript==0.23.1
+tree-sitter-typescript==0.23.2
+tree-sitter-java>=0.23,<0.24
+tree-sitter-c-sharp>=0.23,<0.24
+tree-sitter-php>=0.23,<0.24
+
+# --- MCP server (in-process; no FastAPI, so no Starlette version conflict) ---
+mcp==1.2.0
+
+# --- Tests ---
+pytest==8.3.4
