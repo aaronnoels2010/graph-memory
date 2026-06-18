@@ -18,6 +18,8 @@ DEFAULT_IGNORE_DIRS = {
     "__pycache__",
     "dist",
     "build",
+    "bin",
+    "obj",
     ".mypy_cache",
     ".pytest_cache",
     ".ruff_cache",
