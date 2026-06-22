@@ -12,12 +12,33 @@ from . import gitinfo
 from .config import Settings, get_settings
 from .db import GraphDB
 from .exceptions import GitUnavailableError
-from .indexer import index_codebase
+from .indexer import index_codebase, scan_changes
 from .logging_config import configure_logging
 from .models import Edge, Symbol
 
 # Hard caps so a single tool call can never dump an unbounded blob into context.
 MAX_RESULTS = 100
+
+# Directory names and filename shapes that mark a file as tests, across the
+# supported languages' conventions.
+_TEST_DIRS = {"test", "tests", "__tests__", "spec", "specs"}
+
+
+def _is_test_file(path: str) -> bool:
+    if not path:
+        return False
+    parts = path.replace("\\", "/").split("/")
+    if any(seg.lower() in _TEST_DIRS for seg in parts[:-1]):
+        return True
+    base = parts[-1]
+    stem = base.split(".")[0]
+    low = stem.lower()
+    lowbase = base.lower()
+    return (
+        low.startswith("test_") or low.endswith("_test") or low.endswith("_tests")
+        or ".test." in lowbase or ".spec." in lowbase
+        or stem.endswith("Test") or stem.endswith("Tests") or stem.endswith("Spec")
+    )
 
 
 class GraphService:
@@ -62,20 +83,51 @@ class GraphService:
     def callees(self, symbol: str, limit: int = MAX_RESULTS) -> dict:
         return self._edge_view(symbol, self.db.callees, "callees", limit, by="dst")
 
-    def blast_radius(self, symbol: str, max_depth: int = 2) -> dict:
+    def blast_radius(self, symbol: str, max_depth: int = 2, resolved_only: bool = False) -> dict:
         resolved = self._resolve_one(symbol)
         if "error" in resolved:
             return resolved
         sid = resolved["symbol"]["id"]
-        pairs = self.db.blast_radius(sid, max_depth=max(1, min(max_depth, 6)))
+        depth = max(1, min(max_depth, 6))
+        pairs = self.db.blast_radius(sid, max_depth=depth, resolved_only=resolved_only)
 
         by_file = self._group_affected(pairs[:MAX_RESULTS])
         return {
             "symbol": resolved["symbol"],
-            "max_depth": max(1, min(max_depth, 6)),
+            "max_depth": depth,
+            "resolved_only": resolved_only,
             "affected_count": len(pairs),
+            "heuristic_count": sum(1 for _, _, via in pairs if via == "heuristic"),
             "truncated": len(pairs) > MAX_RESULTS,
             "files_affected": len(by_file),
+            "by_file": by_file,
+        }
+
+    def affected_tests(self, symbol: str, max_depth: int = 3) -> dict:
+        """Tests that exercise ``symbol`` (directly or transitively).
+
+        The dependents of a symbol that live in test files are exactly the tests
+        worth re-running after changing it — a cheap, high-signal slice of the
+        blast radius. Test files are detected by path convention (``tests/``,
+        ``test_*``, ``*_test``, ``*.spec.*``, ``FooTest``...).
+        """
+        resolved = self._resolve_one(symbol)
+        if "error" in resolved:
+            return resolved
+        sid = resolved["symbol"]["id"]
+        depth = max(1, min(max_depth, 6))
+        pairs = self.db.blast_radius(sid, max_depth=depth)
+        files = self.db.symbol_files(affected_id for affected_id, _, _ in pairs)
+        test_pairs = [
+            (aid, d, via) for (aid, d, via) in pairs if _is_test_file(files.get(aid, ""))
+        ]
+        by_file = self._group_affected(test_pairs[:MAX_RESULTS])
+        return {
+            "symbol": resolved["symbol"],
+            "max_depth": depth,
+            "test_count": len(test_pairs),
+            "test_files": sorted(by_file),
+            "truncated": len(test_pairs) > MAX_RESULTS,
             "by_file": by_file,
         }
 
@@ -113,7 +165,8 @@ class GraphService:
             "path": path,
         }
 
-    def diff_blast_radius(self, files: list[str] | None = None, max_depth: int = 2) -> dict:
+    def diff_blast_radius(self, files: list[str] | None = None, max_depth: int = 2,
+                          resolved_only: bool = False) -> dict:
         """Combined blast radius of changed files (explicit or from ``git diff``)."""
         if files is None:
             if not gitinfo.is_git_repo(self.root):
@@ -137,13 +190,17 @@ class GraphService:
             }
 
         max_depth = max(1, min(max_depth, 6))
-        pairs = self.db.blast_radius_for_files(changed, max_depth=max_depth)
+        pairs = self.db.blast_radius_for_files(
+            changed, max_depth=max_depth, resolved_only=resolved_only
+        )
         by_file = self._group_affected(pairs[:MAX_RESULTS])
         return {
             "changed_files": changed,
             "unknown_files": unknown,
             "max_depth": max_depth,
+            "resolved_only": resolved_only,
             "affected_count": len(pairs),
+            "heuristic_count": sum(1 for _, _, via in pairs if via == "heuristic"),
             "truncated": len(pairs) > MAX_RESULTS,
             "files_affected": len(by_file),
             "by_file": by_file,
@@ -195,7 +252,34 @@ class GraphService:
         }
 
     def stats(self) -> dict:
-        return self.db.stats()
+        return {**self.db.stats(), "resolution": self.db.resolution_stats()}
+
+    def status(self, path: str | None = None) -> dict:
+        """Report whether the on-disk graph is current.
+
+        Compares indexed files against what's on disk (cheaply: by mtime, falling
+        back to a content hash only when mtime differs) so an agent knows when to
+        reindex before trusting a blast radius. Capped lists keep the response
+        small even when many files changed.
+        """
+        self._ensure_root(Path(path) if path else self.root)
+        base = self.db.stats()
+        if base["files"] == 0:
+            return {"root": str(self.root), "indexed": False, "stale": True, **base}
+        changes = scan_changes(self.db, self.settings, root=self.root)
+        stale = bool(changes["changed"] or changes["added"] or changes["removed"])
+        return {
+            "root": str(self.root),
+            "indexed": True,
+            "stale": stale,
+            "changed_files": changes["changed"][:MAX_RESULTS],
+            "added_files": changes["added"][:MAX_RESULTS],
+            "removed_files": changes["removed"][:MAX_RESULTS],
+            "changed_count": len(changes["changed"]),
+            "added_count": len(changes["added"]),
+            "removed_count": len(changes["removed"]),
+            **base,
+        }
 
     # --- internals -----------------------------------------------------------
     def _resolve_one(self, ref: str) -> dict:
@@ -244,17 +328,19 @@ class GraphService:
             "truncated": len(edges) > limit,
         }
 
-    def _group_affected(self, pairs: list[tuple[str, int]]) -> dict[str, list[dict]]:
-        """Group (symbol_id, depth) pairs by file into a compact, scannable view."""
-        symbols = self.db.get_symbols(affected_id for affected_id, _ in pairs)
+    def _group_affected(self, pairs: list[tuple[str, int, str]]) -> dict[str, list[dict]]:
+        """Group (symbol_id, depth, reached_via) triples by file into a compact,
+        scannable view. ``reached_via`` tells whether a symbol's inclusion rests
+        on a guessed (heuristic) edge anywhere on its shortest path."""
+        symbols = self.db.get_symbols(affected_id for affected_id, _, _ in pairs)
         by_file: dict[str, list[dict]] = {}
-        for affected_id, depth in pairs:
+        for affected_id, depth, reached_via in pairs:
             sym = symbols.get(affected_id)
             if sym is None:
                 continue
             by_file.setdefault(sym.file, []).append(
                 {"id": sym.id, "qualname": sym.qualname, "kind": sym.kind,
-                 "line": sym.start_line, "depth": depth}
+                 "line": sym.start_line, "depth": depth, "reached_via": reached_via}
             )
         return by_file
 

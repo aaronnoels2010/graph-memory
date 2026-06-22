@@ -112,16 +112,34 @@ def get_callees(symbol: str, limit: int = 100) -> dict:
 
 
 @mcp.tool()
-def blast_radius(symbol: str, max_depth: int = 2) -> dict:
+def blast_radius(symbol: str, max_depth: int = 2, resolved_only: bool = False) -> dict:
     """Estimate what breaks if a symbol changes: the transitive set of dependents.
 
-    Walks the call/reference/inheritance graph in reverse, grouped by file.
+    Walks the call/reference/inheritance graph in reverse, grouped by file. Each
+    affected symbol carries reached_via="resolved" or "heuristic" — "heuristic"
+    means its inclusion depends on a guessed edge somewhere on its path, so trust
+    it less. The response also reports heuristic_count.
 
     Args:
         symbol: A name or full symbol id.
         max_depth: How many hops of dependents to include (1–6).
+        resolved_only: Follow only confidently-resolved edges (drops guessed ones).
     """
-    return service().blast_radius(symbol, max_depth)
+    return service().blast_radius(symbol, max_depth, resolved_only)
+
+
+@mcp.tool()
+def affected_tests(symbol: str, max_depth: int = 3) -> dict:
+    """List the tests that exercise a symbol — what to re-run after changing it.
+
+    The dependents of the symbol that live in test files (by path convention:
+    tests/, test_*, *_test, *.spec.*, FooTest, ...), grouped by file.
+
+    Args:
+        symbol: A name or full symbol id.
+        max_depth: How many hops of dependents to consider as test coverage (1–6).
+    """
+    return service().affected_tests(symbol, max_depth)
 
 
 @mcp.tool()
@@ -151,17 +169,33 @@ def path_between(src: str, dst: str, max_depth: int = 6) -> dict:
 
 
 @mcp.tool()
-def diff_blast_radius(files: list[str] | None = None, max_depth: int = 2) -> dict:
+def diff_blast_radius(files: list[str] | None = None, max_depth: int = 2,
+                      resolved_only: bool = False) -> dict:
     """Combined blast radius of changed files: what downstream code is affected.
 
     With no arguments, auto-detects changed files via `git diff` (staged,
     unstaged, and untracked) against HEAD. Ideal before/within a PR or refactor.
+    Affected symbols carry reached_via (see blast_radius).
 
     Args:
         files: Repo-relative paths to treat as changed (defaults to git diff).
         max_depth: How many hops of dependents to include (1–6).
+        resolved_only: Follow only confidently-resolved edges (drops guessed ones).
     """
-    return service().diff_blast_radius(files, max_depth)
+    return service().diff_blast_radius(files, max_depth, resolved_only)
+
+
+@mcp.tool()
+def index_status(path: str | None = None) -> dict:
+    """Check whether the indexed graph is current with the files on disk.
+
+    Returns stale=true with the changed/added/removed file lists when a reindex
+    is needed — query results are only trustworthy when the graph is fresh.
+
+    Args:
+        path: Root directory to check (defaults to the server's ROOT_PATH).
+    """
+    return service().status(path)
 
 
 @mcp.tool()

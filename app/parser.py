@@ -126,6 +126,35 @@ def _imported_names(import_node) -> list[str]:
     return names
 
 
+def _import_pairs(import_node) -> list[tuple[str, str]]:
+    """Yield ``(imported_name, source_module)`` for an import statement.
+
+    For ``from M import a, b`` the module ``M`` is captured so the resolver can
+    later disambiguate a bare ``a()`` call to the symbol defined in ``M``. Other
+    import forms (plain ``import x``, JS/Java/etc.) keep the previous best-effort
+    name extraction with an empty module, so they record the imported name
+    without claiming a source we can't reliably read.
+    """
+    if import_node.type == "import_from_statement":
+        mod_node = import_node.child_by_field_name("module_name")
+        module = _text(mod_node).strip() if mod_node is not None else ""
+        names: list[str] = []
+        for child in import_node.children:
+            if child is mod_node:
+                continue
+            if child.type == "aliased_import":
+                alias = child.child_by_field_name("alias")
+                target = alias if alias is not None else child.child_by_field_name("name")
+                trailing = _trailing_name(target)
+                if trailing:
+                    names.append(trailing)
+            elif child.type in ("dotted_name", "identifier"):
+                names.append(_text(child).split(".")[-1])
+        if names:
+            return [(n, module) for n in names]
+    return [(n, "") for n in _imported_names(import_node)]
+
+
 def parse_source(path: str, source: bytes, language: str) -> ParseResult:
     """Parse one file's bytes into definitions + raw reference occurrences."""
     spec = get_spec(language)
@@ -196,9 +225,10 @@ def parse_source(path: str, source: bytes, language: str) -> ParseResult:
                         Occurrence(path, enclosing_id, callee, "call", child.start_point[0] + 1)
                     )
             elif t in spec.import_nodes:
-                for imported in _imported_names(child):
+                for imported, module in _import_pairs(child):
                     result.occurrences.append(
-                        Occurrence(path, enclosing_id, imported, "import", child.start_point[0] + 1)
+                        Occurrence(path, enclosing_id, imported, "import",
+                                   child.start_point[0] + 1, module=module)
                     )
 
             walk(child, scope_qual, enclosing_id, in_class)

@@ -45,6 +45,7 @@ class Occurrence:
     name: str          # the referenced bare name
     type: str          # one of OCCURRENCE_TYPES
     line: int          # 1-based
+    module: str = ""   # for imports: the source module path ("" when unknown)
 
 
 @dataclass

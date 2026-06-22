@@ -9,7 +9,8 @@ re-deriving structure every session.
 - **Tree-sitter** parsing — purely syntactic; it **never imports or runs** the target code
 - **SQLite** graph store (symbols + occurrences + derived edges), source of truth on local disk
 - **Incremental** indexing — only changed files are re-parsed (content-hash based)
-- **Honest resolution** — call edges are flagged `resolved` (unique match) or `heuristic` (ambiguous)
+- **Honest resolution** — a referenced name is narrowed to its likeliest definition (same-file first, then `from M import …` imports); edges are flagged `resolved` (uniquely identified) or `heuristic` (still ambiguous), and the per-language heuristic rate is reported on every index
+- **Confidence-aware blast radius** — every affected symbol says whether it was `reached_via` a resolved or heuristic edge; pass `resolved_only` to ignore guesses
 - **Token-efficient output** — every query returns compact, `file:line`-anchored dicts, size-capped
 - **In-process MCP server** — no HTTP hop; one venv
 - **Pluggable languages** — Python, TypeScript, JavaScript, Java, C#, and PHP out of the box; add one `LanguageSpec` to extend
@@ -91,11 +92,13 @@ ROOT_PATH=/path/to/your/repo python mcp_server/server.py
 | `find_references(symbol, limit?)` | everywhere X is used | `find_references("Greeter.hello")` |
 | `get_callers(symbol, limit?)` | who calls X? | `get_callers("module_a.py::greet")` |
 | `get_callees(symbol, limit?)` | what does X call? | `get_callees("main")` |
-| `blast_radius(symbol, max_depth?)` | what breaks if X changes? | `blast_radius("helper", 3)` |
+| `blast_radius(symbol, max_depth?, resolved_only?)` | what breaks if X changes? | `blast_radius("helper", 3)` |
+| `affected_tests(symbol, max_depth?)` | which tests should I re-run? | `affected_tests("helper")` |
 | `get_file_outline(path)` | what's in this file? | `get_file_outline("app/db.py")` |
 | `path_between(src, dst, max_depth?)` | how does X reach Y? | `path_between("main", "helper")` |
-| `diff_blast_radius(files?, max_depth?)` | what does my PR affect? | `diff_blast_radius()` |
+| `diff_blast_radius(files?, max_depth?, resolved_only?)` | what does my PR affect? | `diff_blast_radius()` |
 | `fragility(limit?, max_commits?)` | which files are riskiest to touch? | `fragility(20)` |
+| `index_status(path?)` | is the graph stale vs disk? | `index_status()` |
 
 Names can be bare (`greet`), qualified (`Greeter.hello`), or a full id
 (`module_a.py::greet`). When a bare name is ambiguous, queries return the
@@ -125,25 +128,37 @@ than Python. To restrict indexing to a subset, pass `languages=[...]` to
 3. `get_callers` / `get_callees` to navigate the call graph one hop at a time.
 4. `path_between(a, b)` to see *how* one symbol reaches another (the call chain),
    not just *that* it does.
-5. `diff_blast_radius()` mid-PR — auto-detects your `git diff` (staged, unstaged,
-   untracked) and returns the combined downstream impact, grouped by file.
-6. `fragility()` to triage: files that churn often **and** are widely
+5. `affected_tests("the_thing")` to learn which tests cover it — the set worth
+   re-running after the edit.
+6. `diff_blast_radius()` mid-PR — auto-detects your `git diff` (staged, unstaged,
+   untracked) and returns the combined downstream impact, grouped by file. Each
+   affected symbol carries `reached_via` (`resolved`/`heuristic`); pass
+   `resolved_only=True` to drop edges that rest on a guess.
+7. `fragility()` to triage: files that churn often **and** are widely
    depended-upon are the riskiest to change (needs a git work tree).
+8. `index_status()` any time you suspect the repo drifted — it reports whether a
+   reindex is needed and which files changed/added/removed.
 
 ## Limitations (by design — static analysis)
 
 - **Dynamic dispatch / duck typing**: a call through a variable whose type isn't
-  syntactically known resolves by *name*. Multiple definitions of that name →
-  `heuristic` edges to all candidates; truly dynamic calls may be missed.
-- **No cross-name resolution**: import aliasing (`import x as y`) and attribute
-  chains beyond the trailing name aren't followed.
+  syntactically known resolves by *name*, narrowed by same-file scope and
+  `from M import …` imports. When that still leaves several candidates the edges
+  are flagged `heuristic`; truly dynamic calls may be missed.
+- **Import aliasing is bounded**: `from M import f` is followed (and used to
+  disambiguate `f()`), but `import x as y` and deep attribute chains beyond the
+  trailing name still resolve by bare name only.
 - **External calls dropped**: references that don't resolve to an indexed symbol
   (stdlib, third-party) are not stored as edges.
-- **.gitignore is approximated**: common build/vendor dirs and dot-dirs are
-  skipped; arbitrary `.gitignore` rules are not parsed.
+- **.gitignore**: honoured for the repo-root `.gitignore` when the optional
+  `pathspec` package is installed; otherwise approximated by skipping common
+  build/vendor dirs and dot-dirs. Nested `.gitignore` files are not parsed.
 
 These are deliberate trade-offs for speed and zero-execution safety. Treat edges
-as strong hints, not proof.
+as strong hints, not proof — and watch the per-language `heuristic_rate` in the
+index summary to know how much to trust them (overload-heavy languages run
+higher). Use `index_status` to confirm the graph is fresh before relying on a
+blast radius.
 
 ## Tests
 

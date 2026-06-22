@@ -10,6 +10,11 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+try:  # optional: when present, real .gitignore rules are honoured
+    import pathspec
+except ImportError:  # pragma: no cover - exercised only without the extra
+    pathspec = None
+
 from .config import DEFAULT_IGNORE_DIRS, Settings
 from .db import GraphDB
 from .languages import language_for_path
@@ -19,11 +24,32 @@ from .parser import parse_source
 logger = get_logger(__name__)
 
 
+def _gitignore_spec(root: Path):
+    """Build a matcher from the repo-root ``.gitignore`` if pathspec is installed.
+
+    Returns ``None`` when pathspec is unavailable or there is no ``.gitignore``,
+    in which case indexing falls back to the DEFAULT_IGNORE_DIRS approximation.
+    Only the root file is read (nested .gitignores are not), which covers the
+    common case without a full gitignore engine.
+    """
+    if pathspec is None:
+        return None
+    gi = root / ".gitignore"
+    if not gi.is_file():
+        return None
+    try:
+        return pathspec.PathSpec.from_lines("gitwildmatch", gi.read_text().splitlines())
+    except OSError:
+        return None
+
+
 def _iter_source_files(root: Path, languages: set[str], max_bytes: int):
     """Yield (relpath, abspath, lang) for indexable files under root.
 
-    Approximates .gitignore: skips DEFAULT_IGNORE_DIRS and any dot-directory.
+    Skips DEFAULT_IGNORE_DIRS and any dot-directory, and — when pathspec is
+    installed — anything matched by the repo-root ``.gitignore``.
     """
+    spec = _gitignore_spec(root)
     for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
@@ -31,6 +57,8 @@ def _iter_source_files(root: Path, languages: set[str], max_bytes: int):
         if any(p in DEFAULT_IGNORE_DIRS or p.startswith(".") for p in parts[:-1]):
             continue
         rel = path.relative_to(root).as_posix()
+        if spec is not None and spec.match_file(rel):
+            continue
         lang = language_for_path(rel)
         if lang is None or lang not in languages:
             continue
@@ -41,6 +69,38 @@ def _iter_source_files(root: Path, languages: set[str], max_bytes: int):
         except OSError:
             continue
         yield rel, path, lang
+
+
+def scan_changes(db: GraphDB, settings: Settings, *, root: Path | None = None,
+                 languages: list[str] | None = None) -> dict:
+    """Diff the working tree against the indexed graph without re-parsing.
+
+    Cheap by design: trusts an unchanged mtime to mean an unchanged file and only
+    hashes when the mtime differs. Returns sorted ``changed`` / ``added`` /
+    ``removed`` repo-relative path lists.
+    """
+    root = (root or settings.root_path).resolve()
+    langs = set(languages or settings.languages)
+    stored = db.get_file_meta()
+    seen: set[str] = set()
+    changed: list[str] = []
+    added: list[str] = []
+    for rel, abspath, _lang in _iter_source_files(root, langs, settings.max_file_bytes):
+        seen.add(rel)
+        prev = stored.get(rel)
+        if prev is None:
+            added.append(rel)
+            continue
+        prev_hash, prev_mtime = prev
+        try:
+            if abspath.stat().st_mtime == prev_mtime:
+                continue  # mtime matches -> assume unchanged, skip hashing
+            if hashlib.sha1(abspath.read_bytes()).hexdigest() != prev_hash:
+                changed.append(rel)
+        except OSError:
+            continue
+    removed = sorted(set(stored) - seen)
+    return {"changed": sorted(changed), "added": sorted(added), "removed": removed}
 
 
 def index_codebase(
@@ -108,6 +168,7 @@ def index_codebase(
         "removed_files": len(removed),
         "failed_files": failed,
         "edges": edges,
+        "resolution": db.resolution_stats(),
         **db.stats(),
     }
     if failures:

@@ -49,7 +49,8 @@ CREATE TABLE IF NOT EXISTS occurrences (
     src_symbol  TEXT NOT NULL,
     name        TEXT NOT NULL,
     type        TEXT NOT NULL,
-    line        INTEGER NOT NULL
+    line        INTEGER NOT NULL,
+    module      TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_occ_file ON occurrences(file);
 CREATE INDEX IF NOT EXISTS idx_occ_name ON occurrences(name);
@@ -72,6 +73,22 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _module_matches(module: str, file_path: str) -> bool:
+    """True if an import's ``module`` plausibly refers to ``file_path``.
+
+    Best-effort, purely textual: normalise both to dotted form and accept an
+    exact match, a suffix match (``pkg.mod`` for ``a/b/pkg/mod.py``), or a
+    matching final segment (handles relative imports like ``./mod``). Used only
+    to pick between candidates that already share the referenced name, so a loose
+    match can at worst leave the edge flagged ``heuristic`` — never invent one.
+    """
+    mod = module.strip().strip("'\"`").lstrip("./").replace("/", ".").strip(".")
+    if not mod:
+        return False
+    fp = file_path.rsplit(".", 1)[0].replace("/", ".").replace("\\", ".")
+    return fp == mod or fp.endswith("." + mod) or fp.split(".")[-1] == mod.split(".")[-1]
+
+
 def _row_to_symbol(row: sqlite3.Row) -> Symbol:
     return Symbol(
         id=row["id"],
@@ -90,6 +107,10 @@ class GraphDB:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        # WAL lets reads proceed during a write, and busy_timeout makes a brief
+        # lock from a concurrent MCP call wait rather than raise immediately.
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(SCHEMA)
         self._migrate()
         self._conn.commit()
@@ -105,12 +126,22 @@ class GraphDB:
         cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(edges)")}
         if "count" not in cols:
             self._conn.execute("ALTER TABLE edges ADD COLUMN count INTEGER NOT NULL DEFAULT 1")
+        occ_cols = {row["name"] for row in self._conn.execute("PRAGMA table_info(occurrences)")}
+        if "module" not in occ_cols:
+            self._conn.execute("ALTER TABLE occurrences ADD COLUMN module TEXT NOT NULL DEFAULT ''")
 
     # --- file bookkeeping ----------------------------------------------------
     def get_file_hashes(self) -> dict[str, str]:
         return {
             row["path"]: row["hash"]
             for row in self._conn.execute("SELECT path, hash FROM files")
+        }
+
+    def get_file_meta(self) -> dict[str, tuple[str, float]]:
+        """Map path -> (content hash, mtime) for cheap staleness checks."""
+        return {
+            row["path"]: (row["hash"], row["mtime"])
+            for row in self._conn.execute("SELECT path, hash, mtime FROM files")
         }
 
     def known_files(self) -> set[str]:
@@ -134,8 +165,9 @@ class GraphDB:
             ],
         )
         cur.executemany(
-            "INSERT INTO occurrences (file, src_symbol, name, type, line) VALUES (?, ?, ?, ?, ?)",
-            [(o.file, o.src_symbol, o.name, o.type, o.line) for o in occurrences],
+            "INSERT INTO occurrences (file, src_symbol, name, type, line, module) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [(o.file, o.src_symbol, o.name, o.type, o.line, o.module) for o in occurrences],
         )
         cur.execute(
             "INSERT OR REPLACE INTO files (path, hash, mtime, lang, indexed_at) VALUES (?, ?, ?, ?, ?)",
@@ -157,30 +189,66 @@ class GraphDB:
     def rebuild_edges(self) -> int:
         """Resolve every occurrence against the symbol table and rebuild edges.
 
-        A name with exactly one matching symbol -> a "resolved" edge.
-        A name with several matches -> a "heuristic" edge to each candidate.
-        A name with no internal match (stdlib / third-party) -> dropped.
+        Resolution narrows a referenced name to its likeliest definition, in
+        order of decreasing confidence:
 
+          1. exactly one symbol has the name                  -> resolved
+          2. exactly one of several shares the *caller's file* -> resolved
+          3. several share the file                            -> heuristic (those)
+          4. the caller imports the name ``from M`` and one
+             candidate lives in a file matching ``M``          -> resolved
+          5. several candidates match ``M``                    -> heuristic (those)
+          6. nothing narrows it                                -> heuristic (all)
+
+        A name with no internal match (stdlib / third-party) is dropped.
         Repeated occurrences (e.g. the same function called five times) collapse
         into a single edge whose ``count`` records how many occurrences produced
         it, instead of N duplicate rows.
         """
         name_to_ids: dict[str, list[str]] = defaultdict(list)
-        for row in self._conn.execute("SELECT id, name FROM symbols WHERE kind != 'module'"):
+        id_to_file: dict[str, str] = {}
+        for row in self._conn.execute(
+            "SELECT id, name, file FROM symbols WHERE kind != 'module'"
+        ):
             name_to_ids[row["name"]].append(row["id"])
+            id_to_file[row["id"]] = row["file"]
 
-        # (src, dst, name, type) -> occurrence count. resolution is a function of
-        # the name (how many symbols share it), so we track it per key too.
+        # file -> {imported_name -> source module}, used to disambiguate calls to
+        # an imported name (`from M import f; f()`) towards the symbol in M.
+        import_map: dict[str, dict[str, str]] = defaultdict(dict)
+        for row in self._conn.execute(
+            "SELECT file, name, module FROM occurrences WHERE type = 'import' AND module != ''"
+        ):
+            import_map[row["file"]].setdefault(row["name"], row["module"])
+
+        def resolve(candidates: list[str], occ_file: str, name: str) -> tuple[list[str], str]:
+            if len(candidates) == 1:
+                return candidates, "resolved"
+            same_file = [c for c in candidates if id_to_file.get(c) == occ_file]
+            if len(same_file) == 1:
+                return same_file, "resolved"
+            if same_file:
+                return same_file, "heuristic"
+            module = import_map.get(occ_file, {}).get(name)
+            if module:
+                matched = [c for c in candidates if _module_matches(module, id_to_file.get(c, ""))]
+                if len(matched) == 1:
+                    return matched, "resolved"
+                if matched:
+                    return matched, "heuristic"
+            return candidates, "heuristic"
+
+        # (src, dst, name, type) -> occurrence count, with the chosen resolution.
         counts: dict[tuple, int] = defaultdict(int)
         resolutions: dict[tuple, str] = {}
         for row in self._conn.execute(
-            "SELECT src_symbol, name, type FROM occurrences"
+            "SELECT src_symbol, file, name, type FROM occurrences"
         ):
             candidates = name_to_ids.get(row["name"], [])
             if not candidates:
                 continue
-            resolution = "resolved" if len(candidates) == 1 else "heuristic"
-            for dst in candidates:
+            chosen, resolution = resolve(candidates, row["file"], row["name"])
+            for dst in chosen:
                 if dst == row["src_symbol"]:
                     continue  # ignore trivial self-edges
                 key = (row["src_symbol"], dst, row["name"], row["type"])
@@ -232,6 +300,20 @@ class GraphDB:
         ).fetchall()
         return {row["id"]: _row_to_symbol(row) for row in rows}
 
+    def symbol_files(self, symbol_ids: Iterable[str]) -> dict[str, str]:
+        """Map symbol id -> defining file, batched in chunks under SQLite's
+        bound-variable limit (so callers can pass an unbounded blast radius)."""
+        ids = list(symbol_ids)
+        out: dict[str, str] = {}
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            marks = ",".join("?" * len(chunk))
+            for row in self._conn.execute(
+                f"SELECT id, file FROM symbols WHERE id IN ({marks})", chunk
+            ):
+                out[row["id"]] = row["file"]
+        return out
+
     def file_outline(self, path: str) -> list[Symbol]:
         rows = self._conn.execute(
             "SELECT * FROM symbols WHERE file = ? AND kind != 'module' ORDER BY start_line", (path,)
@@ -261,24 +343,31 @@ class GraphDB:
             for r in rows
         ]
 
-    def blast_radius(self, symbol_id: str, max_depth: int = 2) -> list[tuple[str, int]]:
+    def blast_radius(
+        self, symbol_id: str, max_depth: int = 2, resolved_only: bool = False
+    ) -> list[tuple[str, int, str]]:
         """Transitive set of symbols that DEPEND ON ``symbol_id``.
 
         Walks edges in reverse (dependents): if A calls/references/inherits B,
-        then A is in B's blast radius. Returns (symbol_id, depth) excluding the
-        seed, depth being the shortest path found.
+        then A is in B's blast radius. Returns (symbol_id, depth, reached_via)
+        excluding the seed; ``depth`` is the shortest path found and
+        ``reached_via`` is "resolved" when at least one path to the symbol uses
+        only resolved edges, else "heuristic" (its inclusion leans on a guessed
+        edge). With ``resolved_only`` the walk follows resolved edges only.
         """
+        edge_filter = "AND e.resolution = 'resolved'" if resolved_only else ""
         rows = self._conn.execute(
-            """
-            WITH RECURSIVE radius(symbol, depth) AS (
-                SELECT ?, 0
+            f"""
+            WITH RECURSIVE radius(symbol, depth, heur) AS (
+                SELECT ?, 0, 0
                 UNION
-                SELECT e.src_symbol, r.depth + 1
+                SELECT e.src_symbol, r.depth + 1,
+                       MAX(r.heur, CASE e.resolution WHEN 'resolved' THEN 0 ELSE 1 END)
                 FROM edges e
                 JOIN radius r ON e.dst_symbol = r.symbol
-                WHERE r.depth < ?
+                WHERE r.depth < ? {edge_filter}
             )
-            SELECT symbol, MIN(depth) AS depth
+            SELECT symbol, MIN(depth) AS depth, MIN(heur) AS heur
             FROM radius
             WHERE symbol != ?
             GROUP BY symbol
@@ -286,7 +375,7 @@ class GraphDB:
             """,
             (symbol_id, max_depth, symbol_id),
         ).fetchall()
-        return [(r["symbol"], r["depth"]) for r in rows]
+        return [(r["symbol"], r["depth"], "heuristic" if r["heur"] else "resolved") for r in rows]
 
     def path_between(self, src_id: str, dst_id: str, max_depth: int = 6) -> list[str]:
         """Shortest directed dependency path from ``src_id`` to ``dst_id``.
@@ -335,32 +424,37 @@ class GraphDB:
         ).fetchall()
         return [_row_to_symbol(r) for r in rows]
 
-    def blast_radius_for_files(self, paths: Iterable[str], max_depth: int = 2) -> list[tuple[str, int]]:
+    def blast_radius_for_files(
+        self, paths: Iterable[str], max_depth: int = 2, resolved_only: bool = False
+    ) -> list[tuple[str, int, str]]:
         """Combined blast radius of every symbol defined in ``paths``.
 
         Seeds the reverse walk from all symbols in the changed files at once and
         returns dependents *outside* that set — i.e. what downstream code is
-        affected by changing those files. (symbol_id, shortest_depth) pairs.
+        affected by changing those files. (symbol_id, shortest_depth, reached_via)
+        triples; see :meth:`blast_radius` for the ``reached_via`` semantics.
         """
         paths = list(paths)
         if not paths:
             return []
         marks = ",".join("?" * len(paths))
+        edge_filter = "AND e.resolution = 'resolved'" if resolved_only else ""
         rows = self._conn.execute(
             f"""
             WITH RECURSIVE
             seeds(symbol) AS (
                 SELECT id FROM symbols WHERE kind != 'module' AND file IN ({marks})
             ),
-            radius(symbol, depth) AS (
-                SELECT symbol, 0 FROM seeds
+            radius(symbol, depth, heur) AS (
+                SELECT symbol, 0, 0 FROM seeds
                 UNION
-                SELECT e.src_symbol, r.depth + 1
+                SELECT e.src_symbol, r.depth + 1,
+                       MAX(r.heur, CASE e.resolution WHEN 'resolved' THEN 0 ELSE 1 END)
                 FROM edges e
                 JOIN radius r ON e.dst_symbol = r.symbol
-                WHERE r.depth < ?
+                WHERE r.depth < ? {edge_filter}
             )
-            SELECT symbol, MIN(depth) AS depth
+            SELECT symbol, MIN(depth) AS depth, MIN(heur) AS heur
             FROM radius
             WHERE symbol NOT IN (SELECT symbol FROM seeds)
             GROUP BY symbol
@@ -368,7 +462,7 @@ class GraphDB:
             """,
             (*paths, max_depth),
         ).fetchall()
-        return [(r["symbol"], r["depth"]) for r in rows]
+        return [(r["symbol"], r["depth"], "heuristic" if r["heur"] else "resolved") for r in rows]
 
     def file_dependents(self) -> dict[str, int]:
         """Per-file cross-file in-degree: how many edges from *other* files point
@@ -391,6 +485,38 @@ class GraphDB:
             "SELECT file, COUNT(*) AS c FROM symbols WHERE kind != 'module' GROUP BY file"
         ).fetchall()
         return {r["file"]: r["c"] for r in rows}
+
+    def resolution_stats(self) -> dict:
+        """How many edges are confidently resolved vs heuristic, overall and per
+        language (joined via the source symbol's file). A high heuristic rate for
+        a language means its edges — and any blast radius through them — should be
+        trusted less; surfaced so that confidence is measurable, not assumed.
+        """
+        overall = {"resolved": 0, "heuristic": 0}
+        by_language: dict[str, dict[str, int]] = {}
+        for row in self._conn.execute(
+            """
+            SELECT f.lang AS lang, e.resolution AS resolution, COUNT(*) AS c
+            FROM edges e
+            JOIN symbols s ON e.src_symbol = s.id
+            JOIN files f ON s.file = f.path
+            GROUP BY f.lang, e.resolution
+            """
+        ):
+            res = row["resolution"]
+            overall[res] = overall.get(res, 0) + row["c"]
+            lang = by_language.setdefault(row["lang"], {"resolved": 0, "heuristic": 0})
+            lang[res] = lang.get(res, 0) + row["c"]
+
+        def with_rate(d: dict[str, int]) -> dict:
+            total = d.get("resolved", 0) + d.get("heuristic", 0)
+            rate = round(d.get("heuristic", 0) / total, 3) if total else 0.0
+            return {**d, "total": total, "heuristic_rate": rate}
+
+        return {
+            "overall": with_rate(overall),
+            "by_language": {lang: with_rate(d) for lang, d in sorted(by_language.items())},
+        }
 
     def stats(self) -> dict[str, int]:
         def count(table: str) -> int:
